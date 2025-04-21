@@ -1,0 +1,163 @@
+name: Process Feedback
+
+on:
+    issue_comment:
+        types: [created]
+
+permissions:
+    contents: write
+    actions: write
+    pull-requests: write
+
+jobs:
+    process-feedback:
+        if: ${{ github.event.issue.pull_request && contains(github.event.comment.body, '[PROMPT]') }}
+        runs-on: ubuntu-latest
+        steps:
+            - name: React to comment
+              uses: peter-evans/create-or-update-comment@v2
+              with:
+                comment-id: ${{ github.event.comment.id }}
+                reactions: '+1'
+
+            - name: Notify processing started
+              uses: peter-evans/create-or-update-comment@v2
+              with:
+                issue-number: ${{ github.event.issue.number }}
+                body: "📝 Received input! Processing code changes..."
+            
+            - name: Checkout repository
+              uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+            
+            - name: Get PR details and workflow run
+              id: pr_details
+              run: |
+                  gh auth login --with-token <<< "${{ secrets.GITHUB_TOKEN }}"
+                  pr_data=$(gh pr view ${{ github.event.issue.number }} --json headRefName,baseRefName)
+                  original_branch=$(echo "$pr_data" | jq -r .headRefName)
+                  base_branch=$(echo "$pr_data" | jq -r .baseRefName) # Target for the new PR (e.g., main)
+
+                  # Find the most recent run of 'Tests Workflow' on the original PR branch
+                  # Using workflow *file name* might be more robust if the display name changes
+                  run_id=$(gh run list --workflow 'workflow.yml' --branch "$original_branch" --limit 5 --json databaseId,status --jq '.[] | select(.status=="completed" or .status=="failure") | .databaseId' | head -n 1)
+
+                  if [[ -z "$run_id" ]]; then
+                    echo "::error::Could not find a relevant completed workflow run for branch '$original_branch' to download the pytest report."
+                    exit 1
+                  fi
+
+                  echo "original_branch=$original_branch" >> $GITHUB_OUTPUT
+                  echo "base_branch=$base_branch" >> $GITHUB_OUTPUT
+                  echo "run_id=$run_id" >> $GITHUB_OUTPUT
+                  echo "Found workflow run ID: $run_id for branch $original_branch targeting $base_branch"
+                  # Construct the expected unique artifact name
+                  echo "artifact_name=pytest-report-$run_id" >> $GITHUB_OUTPUT
+                  
+            - name: Download pytest report artifact
+              uses: actions/download-artifact@v4
+              with:
+                name: ${{ steps.pr_details.outputs.artifact_name }}
+                path: pytest_report
+                github-token: ${{ secrets.GITHUB_TOKEN }}
+                run-id: ${{ steps.pr_details.outputs.run_id }}
+
+            - name: Check if report was downloaded
+              id: check_report
+              run: |
+                if [[ -f "pytest_report/report.json" ]]; then
+                  echo "Pytest report found."
+                  echo "report_exists=true" >> $GITHUB_OUTPUT
+                  echo "report_path=pytest_report/report.json" >> $GITHUB_OUTPUT
+                else
+                  echo "::warning::Pytest report file (pytest_report/report.json) not found after download attempt for artifact ${{ steps.pr_details.outputs.artifact_name }}."
+                  echo "report_exists=false" >> $GITHUB_OUTPUT
+                  echo "report_path=" >> $GITHUB_OUTPUT # Pass empty path if not found
+                fi
+
+            - name: Determine and Create New Branch
+              id: manage_branch
+              run: |
+                  original_branch="${{ steps.pr_details.outputs.original_branch }}"
+                  new_branch=""
+                  aifix_num=0
+                  base_name_for_aifix="" # The part before -AIFIX-N
+
+                  # Use BASH_REMATCH for safer parsing if original branch contains hyphens
+                  if [[ "$original_branch" =~ ^(.*)-AIFIX-([0-9]+)$ ]]; then
+                      # Already an AIFIX branch, increment number
+                      base_name_for_aifix="${BASH_REMATCH[1]}"
+                      current_num="${BASH_REMATCH[2]}"
+                      aifix_num=$((current_num + 1))
+                      new_branch="${base_name_for_aifix}-AIFIX-${aifix_num}"
+                      echo "Incrementing AIFIX branch: $original_branch -> $new_branch"
+                  else
+                      # First AIFIX attempt for this branch
+                      base_name_for_aifix="$original_branch"
+                      aifix_num=1
+                      new_branch="${original_branch}-AIFIX-${aifix_num}"
+                      echo "Creating first AIFIX branch: $original_branch -> $new_branch"
+                  fi
+
+                  # Configure Git
+                  git config user.name "github-actions[bot]"
+                  git config user.email "github-actions[bot]@users.noreply.github.com"
+
+                  # Checkout the original branch (the one with the code to fix)
+                  git fetch origin "$original_branch"
+                  git checkout "$original_branch"
+
+                  # Create and push the new branch
+                  git checkout -b "$new_branch"
+                  git push -u origin "$new_branch"
+
+                  echo "new_branch=$new_branch" >> $GITHUB_OUTPUT
+                  echo "aifix_num=$aifix_num" >> $GITHUB_OUTPUT
+                  echo "base_name_for_aifix=$base_name_for_aifix" >> $GITHUB_OUTPUT
+
+            - name: Run update implementation
+              uses: ./ # Uses the action in the root directory
+              env:
+                OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+                ASSISTANT_ID: ${{ secrets.ASSISTANT_ID }}
+              with:
+                target-branch: ${{ steps.manage_branch.outputs.new_branch }}
+                github-token: ${{ secrets.GITHUB_TOKEN }}
+                commit-message: "[AIFIX Attempt ${{ steps.manage_branch.outputs.aifix_num }}] Apply AI fix"
+                feedback: ${{ github.event.comment.body }}
+                report-path: "pytest_report/report.json"
+            
+            - name: Create New Pull Request
+              env:
+                  # Use PAT for creating PRs from Actions reliably
+                  GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+              run: |
+                  new_branch="${{ steps.manage_branch.outputs.new_branch }}"
+                  base_branch="${{ steps.pr_details.outputs.base_branch }}" # e.g., main
+                  aifix_num="${{ steps.manage_branch.outputs.aifix_num }}"
+                  # Use base_name_for_aifix if available, otherwise original_branch for title clarity
+                  branch_display_name="${{ steps.manage_branch.outputs.base_name_for_aifix || steps.pr_details.outputs.original_branch }}"
+
+                  pr_title="[AIFIX Attempt ${aifix_num}] AI Fix for ${branch_display_name}"
+                  pr_body="This is AI Fix attempt #${aifix_num} for branch \`${branch_display_name}\`, initiated by a prompt on PR #${{ github.event.issue.number }}.
+
+                  Comment: ${{ github.event.comment.html_url }}
+                  Original PR: #${{ github.event.issue.number }} (This PR will be closed)
+                  Based on test report from run: ${{ steps.pr_details.outputs.run_id }}
+
+                  Created by GitHub Actions."
+
+                  gh pr create \
+                    --base "$base_branch" \
+                    --head "$new_branch" \
+                    --title "$pr_title" \
+                    --body "$pr_body"
+
+            - name: Close Original Pull Request
+              env:
+                  GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+              run: |
+                  new_branch="${{ steps.manage_branch.outputs.new_branch }}"
+                  gh pr comment ${{ github.event.issue.number }} --body "Closing this PR. An AI-generated fix has been proposed in branch \`$new_branch\` and a new PR has been created. Please review the new PR."
+                  gh pr close ${{ github.event.issue.number }}

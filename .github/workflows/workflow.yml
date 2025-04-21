@@ -1,0 +1,165 @@
+name: Tests Workflow
+
+on:
+    pull_request:
+        branches:
+            - main
+
+permissions:
+    contents: write
+    pull-requests: write
+
+jobs:
+    check-branch-status:
+        runs-on: ubuntu-latest
+        outputs:
+            is_aifix: ${{ steps.check_branch.outputs.is_aifix }}
+        steps:
+            - name: Check if branch is AI-generated
+              id: check_branch
+              run: |
+                if [[ "${{ github.head_ref }}" == *"-AIFIX-"* ]]; then
+                  echo "is_aifix=true" >> $GITHUB_OUTPUT
+                else
+                  echo "is_aifix=false" >> $GITHUB_OUTPUT
+                fi
+
+    run-tests:
+        needs: check-branch-status
+        runs-on: ubuntu-latest
+        outputs:
+            pytest_failed: ${{ steps.pytest_result.outputs.pytest_failed }}
+            workflow_run_id: ${{ github.run_id }}
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+            
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                python-version: 3.10.4
+
+            - name: Install dependencies
+              run: |
+                python -m pip install --upgrade pip
+                pip install -r requirements.txt
+
+            - name: Ensure pytest_report directory exists
+              run: mkdir -p pytest_report
+
+            - name: Run pytest
+              id: pytest_result
+              run: |
+                set +e 
+                pytest | tee pytest_output.txt
+                exit_code=${PIPESTATUS[0]} 
+                echo "Pytest exit code: $exit_code" 
+                # Set the output based on the *correct* exit code
+                if [[ "$exit_code" != "0" ]]; then
+                  echo "pytest_failed=true" >> $GITHUB_OUTPUT
+                else
+                  echo "pytest_failed=false" >> $GITHUB_OUTPUT
+                fi
+                echo "exit_code=$exit_code" >> $GITHUB_OUTPUT
+                exit 0
+
+            - name: Comment Failed Test Results on Regular PR
+              if: |
+                needs.check-branch-status.outputs.is_aifix == 'false' &&
+                steps.pytest_result.outputs.pytest_failed == 'true'
+              run: |
+                gh auth login --with-token <<< "${{ secrets.GITHUB_TOKEN }}"
+                TEST_OUTPUT=$(cat pytest_output.txt)
+                cat << EOF > comment.md
+                ⚠️ Tests failed! ⚠️
+
+                <details><summary>Click to view Pytest Output</summary>
+
+                \`\`\`
+                $TEST_OUTPUT
+                \`\`\`
+
+                </details>
+
+                💬 You can ask for an AI to automatically fix the code by commenting with '[PROMPT] your input here'.
+                  - An example input could be: '[PROMPT] Please fix the code to pass all tests.'
+                  - *Note: After submitting input, please wait for the action to run. If nothing happens, double-check that '[PROMPT]' is spelled correctly.*
+                🛠️ You can also choose to implement manual fixes, but please ensure this Pull Request is closed.
+                EOF
+                gh pr comment "${{ github.event.pull_request.number }}" --body-file comment.md
+  
+            - name: Comment Passed Test Results on Regular PR
+              if: |
+                needs.check-branch-status.outputs.is_aifix == 'false' &&
+                steps.pytest_result.outputs.pytest_failed == 'false'
+              run: |
+                gh auth login --with-token <<< "${{ secrets.GITHUB_TOKEN }}"
+                TEST_OUTPUT=$(cat pytest_output.txt)
+                cat << EOF > comment.md
+                ✅ Tests passed successfully!
+
+                <details><summary>Click to view Pytest Output</summary>
+
+                \`\`\`
+                $TEST_OUTPUT
+                \`\`\`
+
+                </details>
+                EOF
+                gh pr comment "${{ github.event.pull_request.number }}" --body-file comment.md
+
+            - name: Comment Failed Test Results on AI Fix PR
+              if: |
+                needs.check-branch-status.outputs.is_aifix == 'true' &&
+                steps.pytest_result.outputs.pytest_failed == 'true'
+              run: |
+                gh auth login --with-token <<< "${{ secrets.GITHUB_TOKEN }}"
+                TEST_OUTPUT=$(cat pytest_output.txt)
+                cat << EOF > comment.md
+                ⚠️ Tests failed for this AI fix ⚠️
+
+                <details><summary>Click to view Pytest Output</summary>
+
+                \`\`\`
+                $TEST_OUTPUT
+                \`\`\`
+
+                </details>
+
+                💬 You can provide feedback for another attempt by commenting with '[PROMPT] your feedback here'.
+                  - *Note: After submitting feedback, please wait for the action to run. If nothing happens, double-check that '[PROMPT]' is spelled correctly.*
+                🛠️ You can also choose to implement manual fixes, but please ensure this Pull Request is closed.
+                EOF
+                gh pr comment "${{ github.event.pull_request.number }}" --body-file comment.md
+
+            - name: Comment Passed Test Results on AI Fix PR
+              if: |
+                needs.check-branch-status.outputs.is_aifix == 'true' &&
+                steps.pytest_result.outputs.pytest_failed == 'false'
+              run: |
+                gh auth login --with-token <<< "${{ secrets.GITHUB_TOKEN }}"
+                TEST_OUTPUT=$(cat pytest_output.txt)
+                cat << EOF > comment.md
+                ✅ Tests passed successfully! The AI-assisted fixes have resolved the issues.
+
+                <details><summary>Click to view Pytest Output</summary>
+
+                \`\`\`
+                $TEST_OUTPUT
+                \`\`\`
+
+                </details>
+                EOF
+                gh pr comment "${{ github.event.pull_request.number }}" --body-file comment.md
+
+            - name: Upload pytest report artifact
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                name: pytest-report-${{ github.run_id }} # Include run_id for uniqueness
+                path: src/pytest_report/report.json
+                retention-days: 7
+
+            - name: Exit with pytest status
+              run: |
+                exit ${{ steps.pytest_result.outputs.exit_code }}

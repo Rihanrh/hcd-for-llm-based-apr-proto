@@ -1,0 +1,22 @@
+name: 'Failed Implementation Fix'
+description: 'Update implementation file with AI-assisted fix based on failed test'
+inputs:
+  github-token:
+    description: 'GitHub token for repository access'
+    required: true
+  commit-message:
+    description: 'Commit message for the update'
+    required: true
+  target-branch:
+    description: 'Target branch to apply the fix'
+    required: true
+  feedback:
+    description: 'User feedback from PR comments'
+    required: false
+    default: 'Run instructions'
+  report-path:
+    description: 'Path to the pytest report file'
+    required: true
+runs:
+  using: 'node16'
+  main: 'dist/index.js'
