@@ -1,5 +1,5 @@
 def search(x, seq):
-    for i in range(len(seq)):
-        if x <= seq[i]:
+    for i, val in enumerate(seq):
+        if x <= val:
             return i
-    return i + 1
+    return 0 if not seq else len(seq)
