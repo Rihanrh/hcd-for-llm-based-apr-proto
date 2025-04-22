@@ -1,10 +1,10 @@
 def bucketsort(arr, k):
     counts = [0] * k
     for x in arr:
-        counts[x + 1] += 1 
+        counts[x] += 1
 
     sorted_arr = []
-    for i, count in enumerate(arr):
-        sorted_arr.extend([i] * count)
+    for i in range(k):
+        sorted_arr.extend([i] * counts[i])
 
     return sorted_arr
