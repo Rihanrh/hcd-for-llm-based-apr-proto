@@ -4,5 +4,4 @@ def flatten(arr):
             for y in flatten(x):
                 yield y
         else:
-            for y in flatten(x):  
-                yield y
+            yield x
