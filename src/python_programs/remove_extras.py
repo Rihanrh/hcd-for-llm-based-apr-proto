@@ -1,5 +1,6 @@
 def remove_extras(lst):
     result = []
-    for i in lst and not result:
-        result += result + i
+    for i in lst:
+        if i not in result:
+            result.append(i)
     return result
